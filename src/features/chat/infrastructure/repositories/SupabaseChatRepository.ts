@@ -1,0 +1,99 @@
+import { supabase } from "@shared/infrastructure/supabase/client";
+import { Message } from "@features/chat/domain/entities/Message";
+import { Room } from "@features/chat/domain/entities/Room";
+import { IChatRepository } from "@features/chat/domain/repositories/IChatRepository";
+import { File } from "expo-file-system";
+
+const BUCKET = "chat-images";
+const MSG_COLUMNS = "id, room_id, user_id, content, image_url, created_at, profiles(username)";
+
+export class SupabaseChatRepository implements IChatRepository {
+ 
+  async getRooms(): Promise<Room[]> {
+    const { data, error } = await supabase
+      .from('rooms').select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return (data ?? []).map(this.mapRoom);
+  }
+ 
+  async createRoom(name: string, userId: string): Promise<Room> {
+    const { data, error } = await supabase
+      .from('rooms').insert({ name, created_by: userId })
+      .select().single();
+    if (error) throw error;
+    return this.mapRoom(data);
+  }
+ 
+  async getMessages(roomId: string): Promise<Message[]> {
+    const { data, error } = await supabase
+      .from('messages')
+      .select(MSG_COLUMNS)
+      .eq('room_id', roomId)
+      .order('created_at', { ascending: true })
+      .limit(50);
+    if (error) throw error;
+    return (data ?? []).map(this.mapMessage);
+  }
+ 
+  async sendMessage(roomId: string, userId: string, content: string, imageUrl?: string): Promise<Message> {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({ room_id: roomId, user_id: userId, content, image_url: imageUrl ?? null })
+      .select(MSG_COLUMNS)
+      .single();
+    if (error) throw error;
+    return this.mapMessage(data);
+  }
+ 
+  async uploadImage(roomId: string, userId: string, localUri: string, mimeType = 'image/jpeg'): Promise<string> {
+    // Carpeta por usuario: la política de Storage solo permite subir a <user_id>/...
+    const ext = mimeType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
+    const path = `${userId}/${roomId}/${Date.now()}.${ext}`;
+    const bytes = await new File(localUri).arrayBuffer();
+    const { error } = await supabase.storage
+      .from(BUCKET)
+      .upload(path, bytes, { contentType: mimeType, upsert: false });
+    if (error) throw error;
+    return supabase.storage.from(BUCKET).getPublicUrl(path).data.publicUrl;
+  }
+
+  subscribeToRoom(roomId: string, onMessage: (msg: Message) => void): () => void {
+    const channel = supabase
+      .channel(`room:${roomId}`)
+      .on('postgres_changes', {
+          event: 'INSERT', schema: 'public',
+          table: 'messages', filter: `room_id=eq.${roomId}`,
+        },
+        async (payload) => {
+          // El payload no incluye el username — se obtiene con una query extra
+          const { data: profile } = await supabase
+            .from('profiles').select('username')
+            .eq('id', payload.new.user_id).single();
+          onMessage({
+            id:             payload.new.id,
+            roomId:         payload.new.room_id,
+            userId:         payload.new.user_id,
+            content:        payload.new.content,
+            imageUrl:       payload.new.image_url ?? undefined,
+            createdAt:      new Date(payload.new.created_at),
+            authorUsername: profile?.username,
+          });
+        }
+      ).subscribe();
+ 
+    return () => { supabase.removeChannel(channel); };
+  }
+ 
+  private mapRoom = (raw: any): Room => ({
+    id: raw.id, name: raw.name,
+    createdBy: raw.created_by, createdAt: new Date(raw.created_at),
+  });
+ 
+  private mapMessage = (raw: any): Message => ({
+    id: raw.id, roomId: raw.room_id, userId: raw.user_id,
+    content: raw.content, imageUrl: raw.image_url ?? undefined,
+    createdAt: new Date(raw.created_at),
+    authorUsername: raw.profiles?.username,
+  });
+}
